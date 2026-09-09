@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import ApplicationServices
 import ServiceManagement
+import Carbon
 
 struct ClipboardItem: Codable, Identifiable, Hashable {
     let id: UUID
@@ -129,24 +130,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 final class PickerController: NSObject, ObservableObject {
     private var panel: NSPanel?
-    private var globalEventMonitor: Any?
     private var localEventMonitor: Any?
     private var pasteboardTimer: Timer?
     private weak var store: ClipboardStore?
+    private var standardHotKey: EventHotKeyRef?
+    private var optionHotKey: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
     @Published var keyboardSelectedID: UUID?
+    @Published var displayResetToken = UUID()
     private var keyboardSelectionIndex = -1
     private var keyboardShortcutActive = false
+    private var keyboardShortcutModifier: NSEvent.ModifierFlags?
+    private var applicationToRestore: NSRunningApplication?
 
     func install(store: ClipboardStore) {
         self.store = store
         pasteboardTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak store] _ in
             Task { @MainActor in store?.captureIfChanged() }
         }
-        // Cmd+C is intentionally observed, but pasteboard polling is the source of truth:
-        // it also catches copies made through menus, contextual actions, and other apps.
-        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
-            DispatchQueue.main.async { _ = self?.handleShortcutEvent(event, store: store) }
-        }
+        installStandardHotKey()
         localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
             return self.handleShortcutEvent(event, store: store) ? nil : event
@@ -159,6 +161,12 @@ final class PickerController: NSObject, ObservableObject {
 
     func show(store: ClipboardStore) {
         self.store = store
+        if let frontmost = NSWorkspace.shared.frontmostApplication,
+           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            applicationToRestore = frontmost
+        }
+        keyboardSelectedID = nil
+        displayResetToken = UUID()
         if let panel { panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let view = HistoryPicker(store: store, controller: self) { [weak self] item in self?.paste(item) } onClose: { [weak self] in self?.close() }
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 480), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
@@ -184,7 +192,8 @@ final class PickerController: NSObject, ObservableObject {
             _ = AXIsProcessTrustedWithOptions(options)
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+        applicationToRestore?.activate(options: [.activateIgnoringOtherApps])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
             let source = CGEventSource(stateID: .combinedSessionState)
             let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) // V
             let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
@@ -196,34 +205,55 @@ final class PickerController: NSObject, ObservableObject {
     private func handleShortcutEvent(_ event: NSEvent, store: ClipboardStore) -> Bool {
         if event.type == .keyDown, event.keyCode == 53, panel?.isVisible == true, NSApplication.shared.isActive {
             keyboardShortcutActive = false
+            keyboardShortcutModifier = nil
             keyboardSelectionIndex = -1
             keyboardSelectedID = nil
             close()
             return true
         }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let commandAndOptionAreDown = modifiers.contains(.command) && modifiers.contains(.option)
+        let shortcutModifiersAreDown = keyboardShortcutModifier.map { modifiers.contains(.command) && modifiers.contains($0) } ?? false
 
-        if keyboardShortcutActive, event.type == .flagsChanged, !commandAndOptionAreDown {
+        if keyboardShortcutActive, event.type == .flagsChanged, !shortcutModifiersAreDown {
             finishKeyboardShortcut(store: store)
             return true
         }
-        let commandAndShiftAreDown = modifiers.contains(.command) && modifiers.contains(.shift)
-        if !keyboardShortcutActive, event.type == .keyDown, event.keyCode == 9, commandAndShiftAreDown, !modifiers.contains(.option) {
-            show(store: store)
-            return true
-        }
-        guard event.type == .keyDown, event.keyCode == 9, commandAndOptionAreDown else { return false }
+        guard event.type == .keyDown, event.keyCode == 9, shortcutModifiersAreDown, keyboardShortcutActive else { return false }
 
-        if !keyboardShortcutActive {
-            keyboardShortcutActive = true
-            keyboardSelectionIndex = -1
-            keyboardSelectedID = nil
-            show(store: store)
-        } else if !event.isARepeat {
+        if !event.isARepeat {
             advanceKeyboardSelection(in: store)
         }
         return true
+    }
+
+    private func installStandardHotKey() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let userData = Unmanaged.passUnretained(self).toOpaque()
+        let handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+            guard let event, let userData else { return noErr }
+            var hotKeyID = EventHotKeyID()
+            let result = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+            guard result == noErr else { return noErr }
+            let controller = Unmanaged<PickerController>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async {
+                if hotKeyID.id == 1 { controller.handleSelectionHotKey(store: ClipboardStore.shared, modifier: .shift) }
+                if hotKeyID.id == 2 { controller.handleSelectionHotKey(store: ClipboardStore.shared, modifier: .option) }
+            }
+            return noErr
+        }, 1, &eventType, userData, &hotKeyHandler)
+        guard handlerStatus == noErr else { return }
+        let options: UInt32 = 0
+        RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(cmdKey | shiftKey), EventHotKeyID(signature: 0x434C5056, id: 1), GetApplicationEventTarget(), options, &standardHotKey)
+        RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(cmdKey | optionKey), EventHotKeyID(signature: 0x434C5056, id: 2), GetApplicationEventTarget(), options, &optionHotKey)
+    }
+
+    private func handleSelectionHotKey(store: ClipboardStore, modifier: NSEvent.ModifierFlags) {
+        if keyboardShortcutActive { advanceKeyboardSelection(in: store); return }
+        keyboardShortcutActive = true
+        keyboardShortcutModifier = modifier
+        keyboardSelectionIndex = -1
+        keyboardSelectedID = nil
+        show(store: store)
     }
 
     private func advanceKeyboardSelection(in store: ClipboardStore) {
@@ -234,6 +264,7 @@ final class PickerController: NSObject, ObservableObject {
 
     private func finishKeyboardShortcut(store: ClipboardStore) {
         keyboardShortcutActive = false
+        keyboardShortcutModifier = nil
         keyboardSelectionIndex = -1
         guard let id = keyboardSelectedID, let item = store.items.first(where: { $0.id == id }) else { return }
         keyboardSelectedID = nil
@@ -250,6 +281,7 @@ struct HistoryPicker: View {
     @State private var selectedTab: HistoryTab = .recent
     @State private var itemAwaitingTitle: ClipboardItem?
     @State private var pinTitle = ""
+    @State private var isRenamingPin = false
     @AppStorage("openAtLogin") private var openAtLogin = false
     @State private var showQuitConfirmation = false
     @State private var loginError: String?
@@ -287,35 +319,51 @@ struct HistoryPicker: View {
             if visible.isEmpty {
                 ContentUnavailableView(selectedTab == .pinned ? "No pinned items" : "No clipboard items", systemImage: selectedTab == .pinned ? "pin" : "clipboard", description: Text(query.isEmpty ? (selectedTab == .pinned ? "Pin an item from Recent to keep it here." : "Copy text anywhere, then press ⌘⇧V.") : "Try a different search."))
             } else {
-                List(visible, selection: $controller.keyboardSelectedID) { item in
-                    HStack(spacing: 10) {
-                        Button { onPick(item) } label: { itemSummary(item) }
-                            .buttonStyle(.plain)
-                        if item.pinnedTitle == nil {
-                            Button { itemAwaitingTitle = item; pinTitle = "" } label: {
-                                Image(systemName: "pin").frame(width: 26, height: 26)
+                ScrollViewReader { proxy in
+                    List(visible, selection: $controller.keyboardSelectedID) { item in
+                        HStack(spacing: 10) {
+                            Button { onPick(item) } label: { itemSummary(item) }
+                                .buttonStyle(.plain)
+                            if item.pinnedTitle == nil {
+                                Button { isRenamingPin = false; itemAwaitingTitle = item; pinTitle = "" } label: {
+                                    Image(systemName: "pin").frame(width: 26, height: 26)
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Pin with a title")
+                            } else {
+                                Button { store.unpin(item) } label: {
+                                    Image(systemName: "pin.fill").frame(width: 26, height: 26)
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Remove pin")
                             }
-                            .buttonStyle(.borderless)
-                            .help("Pin with a title")
-                        } else {
-                            Button { store.unpin(item) } label: {
-                                Image(systemName: "pin.fill").frame(width: 26, height: 26)
+                        }
+                        .padding(.vertical, 4)
+                        .contextMenu {
+                            if item.pinnedTitle == nil {
+                                Button("Pin") { isRenamingPin = false; itemAwaitingTitle = item; pinTitle = "" }
+                            } else {
+                                Button("Rename") { isRenamingPin = true; itemAwaitingTitle = item; pinTitle = item.pinnedTitle ?? "" }
+                                Button("Unpin") { store.unpin(item) }
                             }
-                            .buttonStyle(.borderless)
-                            .help("Remove pin")
+                            Divider()
+                            Button("Delete", role: .destructive) { store.remove(item) }
                         }
                     }
-                    .padding(.vertical, 4)
-                    .contextMenu {
-                        if item.pinnedTitle == nil {
-                            Button("Pin") { itemAwaitingTitle = item; pinTitle = "" }
-                        } else {
-                            Button("Unpin") { store.unpin(item) }
-                        }
-                        Divider()
-                        Button("Delete", role: .destructive) { store.remove(item) }
+                    .listStyle(.inset)
+                    .onAppear { scrollToNewest(using: proxy) }
+                    .onChange(of: controller.displayResetToken) { _, _ in
+                        selectedTab = .recent
+                        query = ""
+                        DispatchQueue.main.async { scrollToNewest(using: proxy) }
                     }
-                }.listStyle(.inset)
+                    .onChange(of: controller.keyboardSelectedID) { _, selectedID in
+                        guard let selectedID else { return }
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo(selectedID, anchor: .center)
+                        }
+                    }
+                }
             }
             Divider()
             HStack {
@@ -331,13 +379,13 @@ struct HistoryPicker: View {
         .frame(minWidth: 620, minHeight: 480)
         .sheet(item: $itemAwaitingTitle) { item in
             VStack(alignment: .leading, spacing: 16) {
-                Text("Pin clipboard item").font(.headline)
-                Text("Give this item a title so it is easy to find later.").foregroundStyle(.secondary)
+                Text(isRenamingPin ? "Rename pinned item" : "Pin clipboard item").font(.headline)
+                Text(isRenamingPin ? "Choose a new title for this pinned item." : "Give this item a title so it is easy to find later.").foregroundStyle(.secondary)
                 TextField("Title", text: $pinTitle).textFieldStyle(.roundedBorder)
                 HStack {
                     Spacer()
                     Button("Cancel") { itemAwaitingTitle = nil }
-                    Button("Pin") { store.pin(item, title: pinTitle); itemAwaitingTitle = nil }
+                    Button(isRenamingPin ? "Rename" : "Pin") { store.pin(item, title: pinTitle); itemAwaitingTitle = nil }
                         .keyboardShortcut(.defaultAction)
                         .disabled(pinTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
@@ -373,5 +421,10 @@ struct HistoryPicker: View {
             openAtLogin = !enabled
             loginError = error.localizedDescription
         }
+    }
+
+    private func scrollToNewest(using proxy: ScrollViewProxy) {
+        guard let newest = store.items.first else { return }
+        proxy.scrollTo(newest.id, anchor: .top)
     }
 }
