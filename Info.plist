@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Clipvault</string>
+  <key>CFBundleDisplayName</key><string>Clipvault</string>
+  <key>CFBundleIdentifier</key><string>local.clipvault</string>
+  <key>CFBundleExecutable</key><string>Clipvault</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSAccessibilityUsageDescription</key><string>Clipvault uses Accessibility to paste the clipboard item you select into your previous app.</string>
+</dict></plist>

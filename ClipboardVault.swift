@@ -1,0 +1,377 @@
+import SwiftUI
+import AppKit
+import ApplicationServices
+import ServiceManagement
+
+struct ClipboardItem: Codable, Identifiable, Hashable {
+    let id: UUID
+    let text: String
+    var copiedAt: Date
+    var pinnedTitle: String?
+
+    init(text: String, copiedAt: Date = .now) {
+        self.id = UUID()
+        self.text = text
+        self.copiedAt = copiedAt
+        self.pinnedTitle = nil
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, text, copiedAt, pinnedTitle }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        text = try values.decode(String.self, forKey: .text)
+        copiedAt = try values.decode(Date.self, forKey: .copiedAt)
+        pinnedTitle = try values.decodeIfPresent(String.self, forKey: .pinnedTitle)
+    }
+}
+
+@MainActor
+final class ClipboardStore: ObservableObject {
+    static let shared = ClipboardStore()
+    @Published private(set) var items: [ClipboardItem] = []
+    private let archiveURL: URL
+    private var changeCount = NSPasteboard.general.changeCount
+    private var internalClipboardText: String?
+
+    init() {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Clipboard Vault", isDirectory: true)
+        archiveURL = support.appendingPathComponent("history.json")
+        load()
+    }
+
+    func captureIfChanged() {
+        let board = NSPasteboard.general
+        guard board.changeCount != changeCount else { return }
+        changeCount = board.changeCount
+        guard let text = board.string(forType: .string), !text.isEmpty else { return }
+        // Reusing an item from Clipvault already moves the original record to the top.
+        if internalClipboardText == text { internalClipboardText = nil; return }
+        items.insert(ClipboardItem(text: text), at: 0)
+        save()
+    }
+
+    func clearAll() { items.removeAll(); save() }
+
+    func pin(_ item: ClipboardItem, title: String) {
+        let cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedTitle.isEmpty, let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[index].pinnedTitle = cleanedTitle
+        save()
+    }
+
+    func unpin(_ item: ClipboardItem) {
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[index].pinnedTitle = nil
+        save()
+    }
+
+    func remove(_ item: ClipboardItem) {
+        items.removeAll { $0.id == item.id }
+        save()
+    }
+
+    func prepareForPaste(_ item: ClipboardItem) {
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        var reused = items.remove(at: index)
+        reused.copiedAt = .now
+        items.insert(reused, at: 0)
+        internalClipboardText = reused.text
+        save()
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: archiveURL),
+              let loaded = try? JSONDecoder().decode([ClipboardItem].self, from: data) else { return }
+        items = loaded.sorted { $0.copiedAt > $1.copiedAt }
+    }
+
+    private func save() {
+        do {
+            try FileManager.default.createDirectory(at: archiveURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let data = try JSONEncoder().encode(items)
+            try data.write(to: archiveURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: archiveURL.path)
+        } catch { NSLog("Clipvault could not save history: %@", error.localizedDescription) }
+    }
+}
+
+@main
+struct ClipboardVaultApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        Settings { EmptyView() }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let controller = PickerController()
+    private var statusItem: NSStatusItem?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let store = ClipboardStore.shared
+        controller.install(store: store)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem?.button {
+            button.image = NSImage(systemSymbolName: "clipboard", accessibilityDescription: "Open Clipvault")
+            button.target = self
+            button.action = #selector(openHistory)
+        }
+        controller.show(store: store)
+    }
+
+    @objc private func openHistory() { controller.show(store: ClipboardStore.shared) }
+}
+
+@MainActor
+final class PickerController: NSObject, ObservableObject {
+    private var panel: NSPanel?
+    private var globalEventMonitor: Any?
+    private var localEventMonitor: Any?
+    private var pasteboardTimer: Timer?
+    private weak var store: ClipboardStore?
+    @Published var keyboardSelectedID: UUID?
+    private var keyboardSelectionIndex = -1
+    private var keyboardShortcutActive = false
+
+    func install(store: ClipboardStore) {
+        self.store = store
+        pasteboardTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak store] _ in
+            Task { @MainActor in store?.captureIfChanged() }
+        }
+        // Cmd+C is intentionally observed, but pasteboard polling is the source of truth:
+        // it also catches copies made through menus, contextual actions, and other apps.
+        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            DispatchQueue.main.async { _ = self?.handleShortcutEvent(event, store: store) }
+        }
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            guard let self else { return event }
+            return self.handleShortcutEvent(event, store: store) ? nil : event
+        }
+        if !AXIsProcessTrusted() {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+        }
+    }
+
+    func show(store: ClipboardStore) {
+        self.store = store
+        if let panel { panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let view = HistoryPicker(store: store, controller: self) { [weak self] item in self?.paste(item) } onClose: { [weak self] in self?.close() }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 480), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel.title = "Clipvault History"
+        panel.isReleasedWhenClosed = false
+        panel.center()
+        panel.contentView = NSHostingView(rootView: view)
+        self.panel = panel
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func close() { panel?.orderOut(nil); panel = nil }
+
+    private func paste(_ item: ClipboardItem) {
+        store?.prepareForPaste(item)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.text, forType: .string)
+        close()
+        // Pasting into the previously focused app needs macOS Accessibility permission.
+        guard AXIsProcessTrusted() else {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            let source = CGEventSource(stateID: .combinedSessionState)
+            let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) // V
+            let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+            down?.flags = .maskCommand; up?.flags = .maskCommand
+            down?.post(tap: .cghidEventTap); up?.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func handleShortcutEvent(_ event: NSEvent, store: ClipboardStore) -> Bool {
+        if event.type == .keyDown, event.keyCode == 53, panel?.isVisible == true, NSApplication.shared.isActive {
+            keyboardShortcutActive = false
+            keyboardSelectionIndex = -1
+            keyboardSelectedID = nil
+            close()
+            return true
+        }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let commandAndOptionAreDown = modifiers.contains(.command) && modifiers.contains(.option)
+
+        if keyboardShortcutActive, event.type == .flagsChanged, !commandAndOptionAreDown {
+            finishKeyboardShortcut(store: store)
+            return true
+        }
+        let commandAndShiftAreDown = modifiers.contains(.command) && modifiers.contains(.shift)
+        if !keyboardShortcutActive, event.type == .keyDown, event.keyCode == 9, commandAndShiftAreDown, !modifiers.contains(.option) {
+            show(store: store)
+            return true
+        }
+        guard event.type == .keyDown, event.keyCode == 9, commandAndOptionAreDown else { return false }
+
+        if !keyboardShortcutActive {
+            keyboardShortcutActive = true
+            keyboardSelectionIndex = -1
+            keyboardSelectedID = nil
+            show(store: store)
+        } else if !event.isARepeat {
+            advanceKeyboardSelection(in: store)
+        }
+        return true
+    }
+
+    private func advanceKeyboardSelection(in store: ClipboardStore) {
+        guard !store.items.isEmpty else { return }
+        keyboardSelectionIndex = (keyboardSelectionIndex + 1) % store.items.count
+        keyboardSelectedID = store.items[keyboardSelectionIndex].id
+    }
+
+    private func finishKeyboardShortcut(store: ClipboardStore) {
+        keyboardShortcutActive = false
+        keyboardSelectionIndex = -1
+        guard let id = keyboardSelectedID, let item = store.items.first(where: { $0.id == id }) else { return }
+        keyboardSelectedID = nil
+        paste(item)
+    }
+}
+
+struct HistoryPicker: View {
+    @ObservedObject var store: ClipboardStore
+    @ObservedObject var controller: PickerController
+    let onPick: (ClipboardItem) -> Void
+    let onClose: () -> Void
+    @State private var query = ""
+    @State private var selectedTab: HistoryTab = .recent
+    @State private var itemAwaitingTitle: ClipboardItem?
+    @State private var pinTitle = ""
+    @AppStorage("openAtLogin") private var openAtLogin = false
+    @State private var showQuitConfirmation = false
+    @State private var loginError: String?
+
+    private enum HistoryTab: String, CaseIterable, Identifiable {
+        case recent = "Recent"
+        case pinned = "Pinned"
+        var id: Self { self }
+    }
+
+    private var visible: [ClipboardItem] {
+        let base = selectedTab == .recent ? store.items : store.items.filter { $0.pinnedTitle != nil }
+        guard !query.isEmpty else { return base }
+        return base.filter {
+            $0.text.localizedCaseInsensitiveContains(query) ||
+            ($0.pinnedTitle?.localizedCaseInsensitiveContains(query) ?? false)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("History", selection: $selectedTab) {
+                ForEach(HistoryTab.allCases) { tab in Text(tab.rawValue).tag(tab) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search \(selectedTab.rawValue.lowercased())", text: $query).textFieldStyle(.plain)
+                Text("\(visible.count)").font(.caption).foregroundStyle(.secondary)
+            }.padding(14)
+            Divider()
+            if visible.isEmpty {
+                ContentUnavailableView(selectedTab == .pinned ? "No pinned items" : "No clipboard items", systemImage: selectedTab == .pinned ? "pin" : "clipboard", description: Text(query.isEmpty ? (selectedTab == .pinned ? "Pin an item from Recent to keep it here." : "Copy text anywhere, then press ⌘⇧V.") : "Try a different search."))
+            } else {
+                List(visible, selection: $controller.keyboardSelectedID) { item in
+                    HStack(spacing: 10) {
+                        Button { onPick(item) } label: { itemSummary(item) }
+                            .buttonStyle(.plain)
+                        if item.pinnedTitle == nil {
+                            Button { itemAwaitingTitle = item; pinTitle = "" } label: {
+                                Image(systemName: "pin").frame(width: 26, height: 26)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Pin with a title")
+                        } else {
+                            Button { store.unpin(item) } label: {
+                                Image(systemName: "pin.fill").frame(width: 26, height: 26)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Remove pin")
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .contextMenu {
+                        if item.pinnedTitle == nil {
+                            Button("Pin") { itemAwaitingTitle = item; pinTitle = "" }
+                        } else {
+                            Button("Unpin") { store.unpin(item) }
+                        }
+                        Divider()
+                        Button("Delete", role: .destructive) { store.remove(item) }
+                    }
+                }.listStyle(.inset)
+            }
+            Divider()
+            HStack {
+                Text("Select an item to paste it").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Toggle("Open at login", isOn: $openAtLogin)
+                    .toggleStyle(.checkbox)
+                    .onChange(of: openAtLogin) { _, enabled in setOpenAtLogin(enabled) }
+                Button("Quit") { showQuitConfirmation = true }
+                    .foregroundStyle(.red)
+            }.padding(12)
+        }
+        .frame(minWidth: 620, minHeight: 480)
+        .sheet(item: $itemAwaitingTitle) { item in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Pin clipboard item").font(.headline)
+                Text("Give this item a title so it is easy to find later.").foregroundStyle(.secondary)
+                TextField("Title", text: $pinTitle).textFieldStyle(.roundedBorder)
+                HStack {
+                    Spacer()
+                    Button("Cancel") { itemAwaitingTitle = nil }
+                    Button("Pin") { store.pin(item, title: pinTitle); itemAwaitingTitle = nil }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(pinTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(24)
+            .frame(width: 360)
+        }
+        .alert("Quit Clipvault?", isPresented: $showQuitConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Quit", role: .destructive) { NSApplication.shared.terminate(nil) }
+        } message: {
+            Text("Clipvault will stop capturing clipboard history until you open it again.")
+        }
+        .alert("Could not update Open at login", isPresented: Binding(get: { loginError != nil }, set: { if !$0 { loginError = nil } })) {
+            Button("OK") { loginError = nil }
+        } message: { Text(loginError ?? "") }
+    }
+
+    @ViewBuilder
+    private func itemSummary(_ item: ClipboardItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if let title = item.pinnedTitle { Text(title).font(.headline).lineLimit(1) }
+            Text(item.text).lineLimit(2).multilineTextAlignment(.leading)
+            Text(item.copiedAt, format: .dateTime.month().day().hour().minute()).font(.caption).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func setOpenAtLogin(_ enabled: Bool) {
+        do {
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch {
+            openAtLogin = !enabled
+            loginError = error.localizedDescription
+        }
+    }
+}
