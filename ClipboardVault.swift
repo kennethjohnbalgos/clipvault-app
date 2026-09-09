@@ -211,6 +211,29 @@ final class PickerController: NSObject, ObservableObject {
             close()
             return true
         }
+        if event.type == .keyDown, (event.keyCode == 125 || event.keyCode == 126), panel?.isVisible == true, NSApplication.shared.isActive, !store.items.isEmpty {
+            let movingDown = event.keyCode == 125
+            if let selectedID = keyboardSelectedID, let index = store.items.firstIndex(where: { $0.id == selectedID }) {
+                keyboardSelectionIndex = movingDown ? min(index + 1, store.items.count - 1) : max(index - 1, 0)
+            } else {
+                keyboardSelectionIndex = movingDown ? 0 : store.items.count - 1
+            }
+            keyboardSelectedID = store.items[keyboardSelectionIndex].id
+            return true
+        }
+        if event.type == .keyDown, (event.keyCode == 51 || event.keyCode == 117), let selectedID = keyboardSelectedID,
+           let index = store.items.firstIndex(where: { $0.id == selectedID }),
+           let item = store.items.first(where: { $0.id == selectedID }), item.pinnedTitle == nil {
+            store.remove(item)
+            if store.items.isEmpty {
+                keyboardSelectedID = nil
+                keyboardSelectionIndex = -1
+            } else {
+                keyboardSelectionIndex = min(index, store.items.count - 1)
+                keyboardSelectedID = store.items[keyboardSelectionIndex].id
+            }
+            return true
+        }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let shortcutModifiersAreDown = keyboardShortcutModifier.map { modifiers.contains(.command) && modifiers.contains($0) } ?? false
 
@@ -248,7 +271,10 @@ final class PickerController: NSObject, ObservableObject {
     }
 
     private func handleSelectionHotKey(store: ClipboardStore, modifier: NSEvent.ModifierFlags) {
-        if keyboardShortcutActive { advanceKeyboardSelection(in: store); return }
+        if keyboardShortcutActive {
+            advanceKeyboardSelection(in: store)
+            return
+        }
         keyboardShortcutActive = true
         keyboardShortcutModifier = modifier
         keyboardSelectionIndex = -1
@@ -329,12 +355,14 @@ struct HistoryPicker: View {
                                     Image(systemName: "pin").frame(width: 26, height: 26)
                                 }
                                 .buttonStyle(.borderless)
+                                .foregroundStyle(.orange)
                                 .help("Pin with a title")
                             } else {
                                 Button { store.unpin(item) } label: {
                                     Image(systemName: "pin.fill").frame(width: 26, height: 26)
                                 }
                                 .buttonStyle(.borderless)
+                                .foregroundStyle(.orange)
                                 .help("Remove pin")
                             }
                         }
@@ -346,8 +374,10 @@ struct HistoryPicker: View {
                                 Button("Rename") { isRenamingPin = true; itemAwaitingTitle = item; pinTitle = item.pinnedTitle ?? "" }
                                 Button("Unpin") { store.unpin(item) }
                             }
-                            Divider()
-                            Button("Delete", role: .destructive) { store.remove(item) }
+                            if item.pinnedTitle == nil {
+                                Divider()
+                                Button("Delete", role: .destructive) { store.remove(item) }
+                            }
                         }
                     }
                     .listStyle(.inset)
