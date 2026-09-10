@@ -22,6 +22,7 @@ Clipvault is distributed as an unsigned local app bundle. The included app is re
 - Copy text normally with **⌘C**. Clipvault records plain-text clipboard changes locally.
 - Click Clipvault’s menu-bar clipboard icon to open history.
 - Press **⌘⇧V** or **⌘⌥V** anywhere to open history.
+- Click an item to select it; double-click it to copy its text back to the clipboard without pasting.
 - To paste by keyboard: hold the shortcut modifiers, press **V** again to select the first item, then press **V** again to advance. Releasing either modifier pastes the selected item into the previously active app.
 - Use **↑** and **↓** to move through the visible list. Press **Delete** to remove a selected non-pinned item.
 - Press **Esc** to close the window. The red **Quit** button stops Clipvault entirely after confirmation.

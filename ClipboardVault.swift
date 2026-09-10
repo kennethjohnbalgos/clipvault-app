@@ -168,7 +168,7 @@ final class PickerController: NSObject, ObservableObject {
         keyboardSelectedID = nil
         displayResetToken = UUID()
         if let panel { panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let view = HistoryPicker(store: store, controller: self) { [weak self] item in self?.paste(item) } onClose: { [weak self] in self?.close() }
+        let view = HistoryPicker(store: store, controller: self, onCopy: { [weak self] item in self?.copy(item) }, onClose: { [weak self] in self?.close() })
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 480), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "Clipvault History"
         panel.isReleasedWhenClosed = false
@@ -182,9 +182,7 @@ final class PickerController: NSObject, ObservableObject {
     private func close() { panel?.orderOut(nil); panel = nil }
 
     private func paste(_ item: ClipboardItem) {
-        store?.prepareForPaste(item)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(item.text, forType: .string)
+        copy(item)
         close()
         // Pasting into the previously focused app needs macOS Accessibility permission.
         guard AXIsProcessTrusted() else {
@@ -200,6 +198,17 @@ final class PickerController: NSObject, ObservableObject {
             down?.flags = .maskCommand; up?.flags = .maskCommand
             down?.post(tap: .cghidEventTap); up?.post(tap: .cghidEventTap)
         }
+    }
+
+    private func copy(_ item: ClipboardItem) {
+        store?.prepareForPaste(item)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.text, forType: .string)
+    }
+
+    func select(_ item: ClipboardItem, in store: ClipboardStore) {
+        keyboardSelectedID = item.id
+        keyboardSelectionIndex = store.items.firstIndex(where: { $0.id == item.id }) ?? -1
     }
 
     private func handleShortcutEvent(_ event: NSEvent, store: ClipboardStore) -> Bool {
@@ -301,7 +310,7 @@ final class PickerController: NSObject, ObservableObject {
 struct HistoryPicker: View {
     @ObservedObject var store: ClipboardStore
     @ObservedObject var controller: PickerController
-    let onPick: (ClipboardItem) -> Void
+    let onCopy: (ClipboardItem) -> Void
     let onClose: () -> Void
     @State private var query = ""
     @State private var selectedTab: HistoryTab = .recent
@@ -348,8 +357,13 @@ struct HistoryPicker: View {
                 ScrollViewReader { proxy in
                     List(visible, selection: $controller.keyboardSelectedID) { item in
                         HStack(spacing: 10) {
-                            Button { onPick(item) } label: { itemSummary(item) }
-                                .buttonStyle(.plain)
+                            itemSummary(item)
+                                .contentShape(Rectangle())
+                                .onTapGesture { controller.select(item, in: store) }
+                                .onTapGesture(count: 2) {
+                                    controller.select(item, in: store)
+                                    onCopy(item)
+                                }
                             if item.pinnedTitle == nil {
                                 Button { isRenamingPin = false; itemAwaitingTitle = item; pinTitle = "" } label: {
                                     Image(systemName: "pin").frame(width: 26, height: 26)
@@ -367,6 +381,7 @@ struct HistoryPicker: View {
                             }
                         }
                         .padding(.vertical, 4)
+                        .tag(item.id)
                         .contextMenu {
                             if item.pinnedTitle == nil {
                                 Button("Pin") { isRenamingPin = false; itemAwaitingTitle = item; pinTitle = "" }
