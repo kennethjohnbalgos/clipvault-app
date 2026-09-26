@@ -11,8 +11,8 @@ cask "clipvault" do
 
   app "Clipvault.app"
 
-  postflight do
-    system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/Clipvault.app"]
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/Clipvault.app"]
   end
 
   zap trash: [
