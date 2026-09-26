@@ -12,14 +12,14 @@ Clipvault is a private, local macOS clipboard-history app. It captures plain-tex
 ### Homebrew (recommended)
 
 ```sh
-brew tap kennethjohnbalgos/clipvault-app
-brew install --cask clipvault
+brew tap kennethjohnbalgos/clipvault-app https://github.com/kennethjohnbalgos/clipvault-app
+brew install --cask kennethjohnbalgos/clipvault-app/clipvault
 ```
 
 To update Clipvault later:
 
 ```sh
-brew upgrade --cask clipvault
+brew upgrade --cask kennethjohnbalgos/clipvault-app/clipvault
 ```
 
 Homebrew updates replace the app bundle only. Your clipboard history remains at `~/Library/Application Support/Clipboard Vault/history.json`.
@@ -27,13 +27,13 @@ Homebrew updates replace the app bundle only. Your clipboard history remains at 
 To uninstall the app while keeping your history:
 
 ```sh
-brew uninstall --cask clipvault
+brew uninstall --cask kennethjohnbalgos/clipvault-app/clipvault
 ```
 
 To remove the app **and** all saved history deliberately:
 
 ```sh
-brew uninstall --cask --zap clipvault
+brew uninstall --cask --zap kennethjohnbalgos/clipvault-app/clipvault
 ```
 
 ### Manual installation

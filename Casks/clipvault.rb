@@ -7,7 +7,7 @@ cask "clipvault" do
   desc "Private local clipboard history for macOS"
   homepage "https://github.com/kennethjohnbalgos/clipvault-app"
 
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   app "Clipvault.app"
 
