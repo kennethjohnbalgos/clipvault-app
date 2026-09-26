@@ -4,7 +4,7 @@ Clipvault is a private, local macOS clipboard-history app. It captures plain-tex
 
 ## Requirements
 
-- macOS 13 Ventura or later
+- macOS 14 Sonoma or later
 - Accessibility permission, needed for Clipvault to paste the selected item back into the app you were using
 
 ## Install
@@ -38,7 +38,7 @@ brew uninstall --cask --zap kennethjohnbalgos/clipvault-app/clipvault
 
 ### Manual installation
 
-1. Download the `Clipvault-1.0.0.zip` asset from the latest GitHub release and unzip it.
+1. Download the `Clipvault-1.0.1.zip` asset from the latest GitHub release and unzip it.
 2. Drag **`Clipvault.app`** into your **Applications** folder.
 3. Open Clipvault. The history window appears immediately and a clipboard icon remains in the menu bar.
 4. If macOS warns that the app is from an unidentified developer, Control-click **Clipvault.app**, choose **Open**, then choose **Open** again.
