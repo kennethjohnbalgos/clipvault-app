@@ -1,3 +1,4 @@
 *.app/
 *.iconset/
+dist/
 .DS_Store

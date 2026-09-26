@@ -9,7 +9,36 @@ Clipvault is a private, local macOS clipboard-history app. It captures plain-tex
 
 ## Install
 
-1. Download this repository as a ZIP from GitHub and unzip it, or clone it.
+### Homebrew (recommended)
+
+```sh
+brew tap kennethjohnbalgos/clipvault-app
+brew install --cask clipvault
+```
+
+To update Clipvault later:
+
+```sh
+brew upgrade --cask clipvault
+```
+
+Homebrew updates replace the app bundle only. Your clipboard history remains at `~/Library/Application Support/Clipboard Vault/history.json`.
+
+To uninstall the app while keeping your history:
+
+```sh
+brew uninstall --cask clipvault
+```
+
+To remove the app **and** all saved history deliberately:
+
+```sh
+brew uninstall --cask --zap clipvault
+```
+
+### Manual installation
+
+1. Download the `Clipvault-1.0.0.zip` asset from the latest GitHub release and unzip it.
 2. Drag **`Clipvault.app`** into your **Applications** folder.
 3. Open Clipvault. The history window appears immediately and a clipboard icon remains in the menu bar.
 4. If macOS warns that the app is from an unidentified developer, Control-click **Clipvault.app**, choose **Open**, then choose **Open** again.
@@ -20,13 +49,14 @@ Clipvault is distributed as an unsigned local app bundle. The included app is re
 ## Use Clipvault
 
 - Copy text normally with **⌘C**. Clipvault records plain-text clipboard changes locally.
-- Click Clipvault’s menu-bar clipboard icon to open history.
+- Click Clipvault’s menu-bar clipboard icon to toggle history open or closed.
 - Press **⌘⇧V** or **⌘⌥V** anywhere to open history.
-- Click an item to select it; double-click it to copy its text back to the clipboard without pasting.
+- Click an item to select it; double-click it to copy the text, close Clipvault, and attempt to paste into the previously active field.
+- Press **Return** or **Enter** when an item is selected to do the same.
 - To paste by keyboard: hold the shortcut modifiers, press **V** again to select the first item, then press **V** again to advance. Releasing either modifier pastes the selected item into the previously active app.
 - Use **↑** and **↓** to move through the visible list. Press **Delete** to remove a selected non-pinned item.
-- Press **Esc** to close the window. The red **Quit** button stops Clipvault entirely after confirmation.
-- Enable **Open at login** at the bottom of the window to start Clipvault automatically.
+- Press **Esc** to close the window.
+- Use the gear menu at the bottom-left to import or export history, enable **Start at login**, or quit. Import merges a Clipvault JSON export with your existing history.
 
 ## Pins
 

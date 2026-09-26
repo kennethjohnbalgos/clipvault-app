@@ -3,6 +3,8 @@ import AppKit
 import ApplicationServices
 import ServiceManagement
 import Carbon
+@preconcurrency import UserNotifications
+import UniformTypeIdentifiers
 
 struct ClipboardItem: Codable, Identifiable, Hashable {
     let id: UUID
@@ -82,6 +84,19 @@ final class ClipboardStore: ObservableObject {
         save()
     }
 
+    func exportData() throws -> Data {
+        try JSONEncoder.pretty.encode(items)
+    }
+
+    func importData(from data: Data) throws {
+        let imported = try JSONDecoder().decode([ClipboardItem].self, from: data)
+        let existingIDs = Set(items.map(\.id))
+        let additions = imported.filter { !existingIDs.contains($0.id) && !$0.text.isEmpty }
+        items.append(contentsOf: additions)
+        items.sort { $0.copiedAt > $1.copiedAt }
+        save()
+    }
+
     private func load() {
         guard let data = try? Data(contentsOf: archiveURL),
               let loaded = try? JSONDecoder().decode([ClipboardItem].self, from: data) else { return }
@@ -95,6 +110,14 @@ final class ClipboardStore: ObservableObject {
             try data.write(to: archiveURL, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: archiveURL.path)
         } catch { NSLog("Clipvault could not save history: %@", error.localizedDescription) }
+    }
+}
+
+private extension JSONEncoder {
+    static var pretty: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
     }
 }
 
@@ -124,7 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.show(store: store)
     }
 
-    @objc private func openHistory() { controller.show(store: ClipboardStore.shared) }
+    @objc private func openHistory() { controller.toggle(store: ClipboardStore.shared) }
 }
 
 @MainActor
@@ -168,7 +191,7 @@ final class PickerController: NSObject, ObservableObject {
         keyboardSelectedID = nil
         displayResetToken = UUID()
         if let panel { panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let view = HistoryPicker(store: store, controller: self, onCopy: { [weak self] item in self?.copy(item) }, onClose: { [weak self] in self?.close() })
+        let view = HistoryPicker(store: store, controller: self, onPaste: { [weak self] item in self?.paste(item) }, onClose: { [weak self] in self?.close() })
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 480), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "Clipvault History"
         panel.isReleasedWhenClosed = false
@@ -179,11 +202,17 @@ final class PickerController: NSObject, ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func toggle(store: ClipboardStore) {
+        if panel?.isVisible == true { close() }
+        else { show(store: store) }
+    }
+
     private func close() { panel?.orderOut(nil); panel = nil }
 
     private func paste(_ item: ClipboardItem) {
         copy(item)
         close()
+        notifyCopyAndPasteAttempt()
         // Pasting into the previously focused app needs macOS Accessibility permission.
         guard AXIsProcessTrusted() else {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -206,6 +235,18 @@ final class PickerController: NSObject, ObservableObject {
         NSPasteboard.general.setString(item.text, forType: .string)
     }
 
+    private func notifyCopyAndPasteAttempt() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Copied to Clipboard"
+            content.body = "Clipvault copied your selection and attempted to paste it."
+            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(request)
+        }
+    }
+
     func select(_ item: ClipboardItem, in store: ClipboardStore) {
         keyboardSelectedID = item.id
         keyboardSelectionIndex = store.items.firstIndex(where: { $0.id == item.id }) ?? -1
@@ -218,6 +259,11 @@ final class PickerController: NSObject, ObservableObject {
             keyboardSelectionIndex = -1
             keyboardSelectedID = nil
             close()
+            return true
+        }
+        if event.type == .keyDown, (event.keyCode == 36 || event.keyCode == 76), panel?.isVisible == true, NSApplication.shared.isActive,
+           let selectedID = keyboardSelectedID, let item = store.items.first(where: { $0.id == selectedID }) {
+            paste(item)
             return true
         }
         if event.type == .keyDown, (event.keyCode == 125 || event.keyCode == 126), panel?.isVisible == true, NSApplication.shared.isActive, !store.items.isEmpty {
@@ -310,7 +356,7 @@ final class PickerController: NSObject, ObservableObject {
 struct HistoryPicker: View {
     @ObservedObject var store: ClipboardStore
     @ObservedObject var controller: PickerController
-    let onCopy: (ClipboardItem) -> Void
+    let onPaste: (ClipboardItem) -> Void
     let onClose: () -> Void
     @State private var query = ""
     @State private var selectedTab: HistoryTab = .recent
@@ -320,6 +366,7 @@ struct HistoryPicker: View {
     @AppStorage("openAtLogin") private var openAtLogin = false
     @State private var showQuitConfirmation = false
     @State private var loginError: String?
+    @State private var dataTransferError: String?
 
     private enum HistoryTab: String, CaseIterable, Identifiable {
         case recent = "Recent"
@@ -362,7 +409,7 @@ struct HistoryPicker: View {
                                 .onTapGesture { controller.select(item, in: store) }
                                 .onTapGesture(count: 2) {
                                     controller.select(item, in: store)
-                                    onCopy(item)
+                                    onPaste(item)
                                 }
                             if item.pinnedTitle == nil {
                                 Button { isRenamingPin = false; itemAwaitingTitle = item; pinTitle = "" } label: {
@@ -412,13 +459,22 @@ struct HistoryPicker: View {
             }
             Divider()
             HStack {
-                Text("Select an item to paste it").font(.caption).foregroundStyle(.secondary)
+                Menu {
+                    Button("Import…") { importHistory() }
+                    Button("Export…") { exportHistory() }
+                    Divider()
+                    Toggle("Start at login", isOn: $openAtLogin)
+                        .onChange(of: openAtLogin) { _, enabled in setOpenAtLogin(enabled) }
+                    Divider()
+                    Button("Quit", role: .destructive) { showQuitConfirmation = true }
+                } label: {
+                    Image(systemName: "gearshape.fill")
+                        .frame(width: 24, height: 24)
+                }
+                .menuStyle(.borderlessButton)
+                .help("Clipvault settings")
                 Spacer()
-                Toggle("Open at login", isOn: $openAtLogin)
-                    .toggleStyle(.checkbox)
-                    .onChange(of: openAtLogin) { _, enabled in setOpenAtLogin(enabled) }
-                Button("Quit") { showQuitConfirmation = true }
-                    .foregroundStyle(.red)
+                Text("Enter or double-click to paste").font(.caption).foregroundStyle(.secondary)
             }.padding(12)
         }
         .frame(minWidth: 620, minHeight: 480)
@@ -447,6 +503,9 @@ struct HistoryPicker: View {
         .alert("Could not update Open at login", isPresented: Binding(get: { loginError != nil }, set: { if !$0 { loginError = nil } })) {
             Button("OK") { loginError = nil }
         } message: { Text(loginError ?? "") }
+        .alert("Could not transfer clipboard history", isPresented: Binding(get: { dataTransferError != nil }, set: { if !$0 { dataTransferError = nil } })) {
+            Button("OK") { dataTransferError = nil }
+        } message: { Text(dataTransferError ?? "") }
     }
 
     @ViewBuilder
@@ -465,6 +524,33 @@ struct HistoryPicker: View {
         } catch {
             openAtLogin = !enabled
             loginError = error.localizedDescription
+        }
+    }
+
+    private func importHistory() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Clipvault History"
+        panel.message = "Choose a Clipvault JSON export. Imported records are merged with your current history."
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try store.importData(from: Data(contentsOf: url))
+        } catch {
+            dataTransferError = "The selected file is not a valid Clipvault export.\n\n\(error.localizedDescription)"
+        }
+    }
+
+    private func exportHistory() {
+        let panel = NSSavePanel()
+        panel.title = "Export Clipvault History"
+        panel.nameFieldStringValue = "Clipvault-history.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try store.exportData().write(to: url, options: .atomic)
+        } catch {
+            dataTransferError = "Clipvault could not export your history.\n\n\(error.localizedDescription)"
         }
     }
 
